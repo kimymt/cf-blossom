@@ -1,0 +1,42 @@
+# Cloudflare Worker Configuration for Blossom Server
+name = "blossom-server"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+# Node.jsのcryptoモジュールなどを使用するために必要
+compatibility_flags = ["nodejs_compat"]
+
+# Environment variables
+[env.production]
+# production 環境の変数
+[env.production.vars]
+# Comma-separated list of allowed Nostr public keys (hex format)
+# Example: "npub1abc123...,npub1def456..."
+ALLOWED_PUBKEYS = "df8f0a640c3ffd09e293999acfa399d0574c8501fcdabceca5072ee2057d87a5"
+
+# Comma-separated list of allowed MIME types
+# Default supports common media types
+ALLOWED_MIME_TYPES = "image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime,audio/mpeg,audio/wav,audio/ogg,application/pdf,text/plain"
+
+# Maximum file size in bytes (default: 10MB)
+MAX_FILE_SIZE = "10485760"
+
+# R2 bucket name (production環境固有)
+R2_BUCKET_NAME = "blossom-bucket"
+
+# R2 bucket binding (production環境固有)
+[[env.production.r2_buckets]]
+binding = "BLOSSOM_BUCKET"
+bucket_name = "blossom-bucket"
+
+# Development environment
+[env.development]
+[env.development.vars]
+ALLOWED_PUBKEYS = ""
+ALLOWED_MIME_TYPES = "image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime,audio/mpeg,audio/wav,audio/ogg,application/pdf,text/plain"
+MAX_FILE_SIZE = "10485760"
+R2_BUCKET_NAME = "blossom-bucket-dev"
+
+[[env.development.r2_buckets]]
+binding = "BLOSSOM_BUCKET"
+bucket_name = "blossom-bucket-dev"
