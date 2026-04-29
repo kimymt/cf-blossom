@@ -2,6 +2,7 @@
   "name": "blossom-server",
   "version": "1.0.0",
   "description": "Blossom Protocol Server on Cloudflare Workers with R2 storage",
+  "type": "module",
   "main": "src/index.js",
   "scripts": {
     "dev": "wrangler dev",
@@ -9,7 +10,7 @@
     "deploy:staging": "wrangler deploy --env development",
     "deploy:production": "wrangler deploy --env production",
     "tail": "wrangler tail",
-    "test": "jest"
+    "test": "NODE_OPTIONS=--experimental-vm-modules node_modules/.bin/jest"
   },
   "keywords": [
     "blossom",
