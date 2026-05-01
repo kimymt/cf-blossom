@@ -1,8 +1,6 @@
 // Blossom Server on Cloudflare Workers with R2
 // Implements BUD-01, BUD-02, and BUD-06 specifications
 
-import { createHash } from 'crypto'; // Node.jsのcryptoモジュールをインポート
-
 // 環境変数の設定
 const CONFIG = {
   // 許可された公開鍵（16進形式、カンマ区切り）
@@ -423,14 +421,14 @@ async function handleListBlobs(request, env, pathname, corsHeaders) {
 
 // BUD-02: DELETE /<SHA256> - オブジェクトの削除
 async function handleDeleteBlob(request, env, pathname, corsHeaders) {
-  // パスからハッシュを抽出
-  const hash = pathname.substring(1);
-  
+  // パスからハッシュと拡張子を抽出
+  const hash = pathname.substring(1).split('.')[0];
+
   // SHA256形式のハッシュであるか検証
   if (!isValidSHA256(hash)) {
-    return new Response('Invalid hash format', { 
-      status: 400, 
-      headers: corsHeaders 
+    return new Response('Invalid hash format', {
+      status: 400,
+      headers: corsHeaders
     });
   }
 
@@ -556,3 +554,5 @@ async function calculateSHA256(data) {
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
+
+export { isValidSHA256, isValidPubkey, calculateSHA256 };
