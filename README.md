@@ -2,6 +2,8 @@
 All contents of this repository are generated using LLMs by non-engineer.
 Please carefully verify the content and use it at your own responsibility.
 
+> 日本語版は [README.ja.md](./README.ja.md) を参照してください。
+
 ## About
 Implementation of a file storage server for the [Blossom protocol](https://github.com/hzrd149/blossom) using Cloudflare Workers and R2 storage.
 
