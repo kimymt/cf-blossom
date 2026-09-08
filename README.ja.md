@@ -14,7 +14,7 @@
 - **[BUD-06](https://github.com/hzrd149/blossom/blob/master/buds/06.md)**: アップロード要件
 - **[Nostr](https://github.com/nostr-protocol/nostr) 認証**: 公開鍵による認証とアクセス制御
 - **R2 ストレージ**: Cloudflare R2 を用いた高速なファイル保存
-- **自動削除**: オブジェクトのメタデータに 24 時間 TTL を保持し、`GET /list/<pubkey>` 時の遅延削除に加え、R2 ライフサイクルルールによって恒久的に削除します
+- **自動削除**: 取得・一覧で24時間の期限を検証し、実データはR2ライフサイクルルールで削除します
 - **ファイル制限**: MIME タイプおよびファイルサイズの制限
 
 ## セットアップ
@@ -109,8 +109,18 @@ npm run tail
 | GET      | `/<sha256>[.ext]`     | BUD-01 | ブロブの取得                                  | 不要     |
 | HEAD     | `/<sha256>[.ext]`     | BUD-01 | ブロブの存在確認                              | 不要     |
 | PUT      | `/upload`             | BUD-02 | ブロブのアップロード（JSON ディスクリプタ返却）| 必要     |
-| HEAD     | `/upload`             | BUD-06 | アップロード要件をヘッダーで返却              | 不要     |
-| GET      | `/list/<pubkey>`      | BUD-02 | 指定 pubkey がアップロードしたブロブの一覧    | 任意     |
-| DELETE   | `/<sha256>[.ext]`     | BUD-02 | ブロブの削除（アップロード者のみ可）          | 必要     |
+| HEAD     | `/upload`             | BUD-06 | アップロード可否をヘッダーで返却              | 必要     |
+| GET      | `/list/<pubkey>`      | BUD-12 | 指定 pubkey がアップロードしたブロブの一覧    | 任意     |
+| DELETE   | `/<sha256>[.ext]`     | BUD-12 | ブロブの削除（アップロード者のみ可）          | 必要     |
 
-認証には Nostr の `kind:24242` イベントを Base64 エンコードし、`Authorization: Nostr <base64-event>` ヘッダーで送信します。作成から 5 分以上経過したイベントは拒否されます。
+認証には Nostr の `kind:24242` イベントを Base64 エンコードし、`Authorization: Nostr <base64-event>` ヘッダーで送信します。イベントIDとSchnorr署名、操作・対象ハッシュ・有効期限を検証します。未来の作成日時は拒否し、serverタグがある場合はドメインを照合します。UTF-8のBase64urlと従来のBase64を受け付けます。
+
+## 更新時の確認事項
+
+既存バケットを更新する場合は[修正内容と移行手順](./SECURITY_FIXES.md)を確認してください。ファイルサイズは既定10MiB、設定上限32MiBです。両環境にレート制限と定期的な索引作成を設定しています。
+
+一覧はアップロード日時の降順で、`?limit=1..20&cursor=<前ページ末尾のsha256>`に対応します。既存データは定期処理で索引を作成してから一覧に表示されます。保存するバイト列は変更しません。
+
+`HEAD /upload`にはアップロード用認証と`X-SHA-256`・`X-Content-Type`・`X-Content-Length`が必要です。拒否理由はステータスと`X-Reason`で返します。HEADを省略したPUTも利用できます。認証は[BUD-11](https://github.com/hzrd149/blossom/blob/master/buds/11.md)、一覧・削除は[BUD-12](https://github.com/hzrd149/blossom/blob/master/buds/12.md)を参照してください。
+
+`npm test`で署名付き回帰テスト、`npm run test:integration`でローカルWorkers/R2統合テストを実行します。既存キャッシュの扱い、R2ライフサイクル設定、索引移行の注意事項は上記の移行手順に記載しています。
