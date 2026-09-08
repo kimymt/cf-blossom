@@ -11,7 +11,7 @@ compatibility_flags = ["nodejs_compat"]
 # production 環境の変数
 [env.production.vars]
 # Comma-separated list of allowed Nostr public keys (hex format)
-# Example: "npub1abc123...,npub1def456..."
+# Use lowercase 64-character HEX keys, not npub strings.
 ALLOWED_PUBKEYS = "df8f0a640c3ffd09e293999acfa399d0574c8501fcdabceca5072ee2057d87a5"
 
 # Comma-separated list of allowed MIME types
@@ -40,3 +40,20 @@ R2_BUCKET_NAME = "blossom-bucket-dev"
 [[env.development.r2_buckets]]
 binding = "BLOSSOM_BUCKET"
 bucket_name = "blossom-bucket-dev"
+
+# Account-unique namespaces; do not reuse these IDs in unrelated Workers.
+[[env.production.ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "900101"
+simple = { limit = 60, period = 60 }
+
+[env.production.triggers]
+crons = ["* * * * *"]
+
+[[env.development.ratelimits]]
+name = "RATE_LIMITER"
+namespace_id = "900102"
+simple = { limit = 60, period = 60 }
+
+[env.development.triggers]
+crons = ["* * * * *"]

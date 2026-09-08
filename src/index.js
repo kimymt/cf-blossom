@@ -1,558 +1,163 @@
-// Blossom Server on Cloudflare Workers with R2
-// Implements BUD-01, BUD-02, and BUD-06 specifications
+import { authorize, HttpError, isValidSHA256, isValidPubkey, calculateSHA256 } from './auth.js';
+import { TTL_MS, active, expiresAt, descriptor, indexKey, indexBlob, listBlobs, maintainIndex } from './storage.js';
 
-// 環境変数の設定
-const CONFIG = {
-  // 許可された公開鍵（16進形式、カンマ区切り）
-  ALLOWED_PUBKEYS: 'ALLOWED_PUBKEYS',
-  // 許可されたMIMEタイプ（カンマ区切り）
-  ALLOWED_MIME_TYPES: 'ALLOWED_MIME_TYPES',
-  // 最大ファイルサイズ（バイト）
-  MAX_FILE_SIZE: 'MAX_FILE_SIZE',
-  // R2バケット名 (R2_BUCKET_NAMEは文字列であり、実際のバインディングはBLOSSOM_BUCKET)
-  R2_BUCKET_NAME: 'R2_BUCKET_NAME' 
-};
-
-// 環境変数が設定されていない場合のデフォルト値
-const DEFAULT_ALLOWED_MIME_TYPES = [
-  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
-  'video/mp4', 'video/webm', 'video/quicktime',
-  'audio/mpeg', 'audio/wav', 'audio/ogg',
-  'application/pdf', 'text/plain'
+const DEFAULT_TYPES = [
+  'image/jpeg', 'image/png', 'image/gif', 'image/webp', 'video/mp4', 'video/webm',
+  'video/quicktime', 'audio/mpeg', 'audio/wav', 'audio/ogg', 'application/pdf', 'text/plain',
 ];
-
-const DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
-
-// MIMEタイプとファイル拡張子のマッピング
-const MIME_TO_EXT = {
-  'image/jpeg': '.jpg',
-  'image/png': '.png',
-  'image/gif': '.gif',
-  'image/webp': '.webp',
-  'video/mp4': '.mp4',
-  'video/webm': '.webm',
-  'video/quicktime': '.mov',
-  'audio/mpeg': '.mp3',
-  'audio/wav': '.wav',
-  'audio/ogg': '.ogg',
-  'application/pdf': '.pdf',
-  'text/plain': '.txt'
+const HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, HEAD, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-SHA-256, X-Content-Type, X-Content-Length, Range, *',
+  'Access-Control-Expose-Headers': 'X-Reason, X-Max-File-Size, X-Allowed-MIME-Types, X-TTL, ETag, Sunset, Retry-After',
+  'Access-Control-Max-Age': '86400',
+  'Cache-Control': 'no-store',
+  'X-Content-Type-Options': 'nosniff',
 };
-
-export default {
-  // すべてのHTTPリクエストを処理するfetchハンドラ
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    const method = request.method;
-    const pathname = url.pathname;
-
-    // CORSヘッダーの設定
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*', // すべてのオリジンからのアクセスを許可
-      'Access-Control-Allow-Methods': 'GET, HEAD, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'Access-Control-Max-Age': '86400', // プリフライトリクエストのキャッシュ期間
-    };
-
-    // プリフライトリクエスト (OPTIONSメソッド) の処理
-    if (method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
-    }
-
-    try {
-      // ルートパス (/) へのGETリクエストの処理
-      // Blossom Server APIが稼働していることを示すメッセージを返す
-      if (pathname === '/' && method === 'GET') {
-        return new Response('Blossom Server API is running. See documentation for usage.', {
-          status: 200,
-          headers: corsHeaders
-        });
-      }
-      
-      // ルーティングのハンドリング
-      // GET /<SHA256>: オブジェクトの取得 (BUD-01)
-      if (method === 'GET' && pathname.match(/^\/[a-f0-9]{64}/)) {
-        return await handleGetBlob(request, env, pathname, corsHeaders);
-      }
-      
-      // HEAD /<SHA256>: オブジェクトの存在確認 (BUD-01)
-      if (method === 'HEAD' && pathname.match(/^\/[a-f0-9]{64}/)) {
-        return await handleHeadBlob(request, env, pathname, corsHeaders);
-      }
-      
-      // PUT /upload: オブジェクトのアップロード (BUD-02)
-      if (method === 'PUT' && pathname === '/upload') {
-        return await handleUpload(request, env, corsHeaders);
-      }
-      
-      // HEAD /upload: アップロード要件の取得 (BUD-06)
-      if (method === 'HEAD' && pathname === '/upload') {
-        return await handleUploadRequirements(request, env, corsHeaders);
-      }
-      
-      // GET /list/<pubkey>: オブジェクトのリスト表示 (BUD-02) - ★ここを追加/修正★
-      if (method === 'GET' && pathname.match(/^\/list\/[a-f0-9]{64}$/)) {
-        return await handleListBlobs(request, env, pathname, corsHeaders);
-      }
-      
-      // DELETE /<SHA256>: オブジェクトの削除 (BUD-02)
-      if (method === 'DELETE' && pathname.match(/^\/[a-f0-9]{64}/)) {
-        return await handleDeleteBlob(request, env, pathname, corsHeaders);
-      }
-
-      // どのルートにも一致しない場合
-      return new Response('Not Found', { 
-        status: 404, 
-        headers: corsHeaders 
-      });
-
-    } catch (error) {
-      // エラーハンドリング
-      console.error('Error:', error);
-      return new Response('Internal Server Error', { 
-        status: 500, 
-        headers: corsHeaders 
-      });
-    }
+let reservedBytes = 0;
+const BUFFER_BUDGET = 48 * 1024 * 1024;
+function policy(env) {
+  const raw = env.MAX_FILE_SIZE ?? '10485760';
+  const maxSize = Number(raw);
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(maxSize) || maxSize < 1 || maxSize > 32 * 1024 * 1024) {
+    throw new HttpError(503, 'MAX_FILE_SIZE must be between 1 and 33554432');
   }
-};
-
-// BUD-01: GET /<SHA256> - オブジェクトの取得
-async function handleGetBlob(request, env, pathname, corsHeaders) {
-  // パスからハッシュと拡張子を抽出
-  const hash = pathname.substring(1).split('.')[0]; 
-  
-  // SHA256形式のハッシュであるか検証
-  if (!isValidSHA256(hash)) {
-    return new Response('Invalid hash format', { 
-      status: 400, 
-      headers: corsHeaders 
-    });
-  }
-
+  const types = env.ALLOWED_MIME_TYPES ? env.ALLOWED_MIME_TYPES.split(',').map(t => t.trim()) : DEFAULT_TYPES;
+  return { maxSize, types };
+}
+function response(body, status = 200, headers = {}) {
+  return new Response(body, { status, headers: { ...HEADERS, ...headers } });
+}
+function json(value, status = 200) {
+  return response(JSON.stringify(value), status, { 'Content-Type': 'application/json' });
+}
+async function rateLimit(env, key) {
+  if (!env.RATE_LIMITER) throw new HttpError(503, 'Rate limiter unavailable');
+  const result = await env.RATE_LIMITER.limit({ key: 'blossom:v1:' + key });
+  if (!result.success) throw new HttpError(429, 'Rate limit exceeded');
+}
+function uploadMetadata(request, config, head) {
+  const type = (request.headers.get(head ? 'X-Content-Type' : 'Content-Type') || 'application/octet-stream')
+    .split(';')[0].trim().toLowerCase();
+  const size = request.headers.get(head ? 'X-Content-Length' : 'Content-Length');
+  if (head && size === null) throw new HttpError(411, 'X-Content-Length required');
+  if (size !== null && (!/^\d+$/.test(size) || !Number.isSafeInteger(Number(size)))) throw new HttpError(400, 'Invalid length');
+  if (size !== null && Number(size) > config.maxSize) throw new HttpError(413, 'File too large');
+  if (!config.types.includes(type)) throw new HttpError(415, 'Unsupported file type');
+  const hash = request.headers.get('X-SHA-256');
+  if ((head || hash !== null) && !isValidSHA256(hash)) throw new HttpError(400, 'Invalid or missing X-SHA-256');
+  return { type, size: size === null ? null : Number(size), hash };
+}
+async function readBounded(request, maxSize, size) {
+  // A single preallocated buffer avoids retaining chunks plus a second copy.
+  const data = new Uint8Array(size ?? maxSize);
+  const reader = request.body?.getReader();
+  let offset = 0;
   try {
-    // R2からオブジェクトを取得 (R2バインディング名 env.BLOSSOM_BUCKET を直接使用)
-    const object = await env.BLOSSOM_BUCKET.get(hash);
-    
-    // オブジェクトが見つからない場合
+    if (reader) {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (offset + value.byteLength > maxSize) throw new HttpError(413, 'File too large');
+        if (offset + value.byteLength > data.byteLength) throw new HttpError(400, 'Content-Length mismatch');
+        data.set(value, offset); offset += value.byteLength;
+      }
+    }
+    if (size !== null && size !== offset) throw new HttpError(400, 'Content-Length mismatch');
+    return data.subarray(0, offset);
+  } catch (error) {
+    if (reader) await reader.cancel().catch(() => {});
+    throw error;
+  } finally { reader?.releaseLock(); }
+}
+async function upload(request, env, config) {
+  const metadata = uploadMetadata(request, config, false);
+  const auth = await authorize(request, env, 'upload', metadata.hash);
+  await rateLimit(env, 'upload:' + auth.pubkey);
+  const reservation = metadata.size ?? config.maxSize;
+  if (reservedBytes + reservation > BUFFER_BUDGET) throw new HttpError(503, 'Upload capacity temporarily exhausted');
+  reservedBytes += reservation;
+  try {
+    const data = await readBounded(request, config.maxSize, metadata.size);
+    const hash = await calculateSHA256(data);
+    if (metadata.hash && metadata.hash !== hash) throw new HttpError(409, 'X-SHA-256 does not match body');
+    if (!auth.hashes.includes(hash)) throw new HttpError(401, 'Blob not authorized');
+    const bucket = env.BLOSSOM_BUCKET;
+    let object = await bucket.head(hash), created = false;
     if (!object) {
-      return new Response('Blob not found', { 
-        status: 404, 
-        headers: corsHeaders 
+      object = await bucket.put(hash, data, {
+        onlyIf: { etagDoesNotMatch: '*' },
+        customMetadata: { contentType: metadata.type, uploader: auth.pubkey,
+          expiresAt: new Date(Date.now() + TTL_MS).toISOString() },
+        httpMetadata: { contentType: metadata.type },
       });
+      created = !!object;
+      if (!object) object = await bucket.head(hash);
     }
-
-    // カスタムメタデータからContent-Typeを取得、なければデフォルト値を使用
-    const metadata = object.customMetadata || {};
-    const contentType = metadata.contentType || 'application/octet-stream';
-    
-    // オブジェクトのボディとヘッダーを付けて応答
-    return new Response(object.body, {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': contentType,
-        'Content-Length': object.size.toString(),
-        'ETag': `"${hash}"`, // ETagヘッダーにハッシュを設定
-        'Cache-Control': 'public, max-age=31536000, immutable' // キャッシュ制御
-      }
-    });
-  } catch (error) {
-    console.error('Error getting blob:', error);
-    return new Response('Internal Server Error', { 
-      status: 500, 
-      headers: corsHeaders 
-    });
-  }
+    if (!object) throw new HttpError(503, 'Concurrent blob change; retry upload');
+    if (!active(object)) throw new HttpError(409, 'Expired blob awaits removal; its owner may delete it before retrying');
+    // Return stored MIME/owner/time on duplicate uploads, including races.
+    await indexBlob(bucket, object);
+    return json(descriptor(object, new URL(request.url).origin), created ? 201 : 200);
+  } finally { reservedBytes -= reservation; }
 }
-
-// BUD-01: HEAD /<SHA256> - オブジェクトの存在確認
-async function handleHeadBlob(request, env, pathname, corsHeaders) {
-  // パスからハッシュを抽出
-  const hash = pathname.substring(1).split('.')[0];
-  
-  // SHA256形式のハッシュであるか検証
-  if (!isValidSHA256(hash)) {
-    return new Response(null, { 
-      status: 400, 
-      headers: corsHeaders 
-    });
+async function getBlob(request, env, hash) {
+  const head = request.method === 'HEAD';
+  const object = head ? await env.BLOSSOM_BUCKET.head(hash) : await env.BLOSSOM_BUCKET.get(hash);
+  if (!active(object)) {
+    if (!head) await object?.body?.cancel?.();
+    throw new HttpError(404, 'Blob not found');
   }
-
-  try {
-    // R2でオブジェクトのヘッダー情報を取得
-    const object = await env.BLOSSOM_BUCKET.head(hash);
-    
-    // オブジェクトが見つからない場合
-    if (!object) {
-      return new Response(null, { 
-        status: 404, 
-        headers: corsHeaders 
-      });
-    }
-
-    // メタデータからContent-Typeを取得
-    const metadata = object.customMetadata || {};
-    const contentType = metadata.contentType || 'application/octet-stream';
-
-    // オブジェクトのメタデータとヘッダーを付けて応答
-    return new Response(null, {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': contentType,
-        'Content-Length': object.size.toString(),
-        'ETag': `"${hash}"`,
-        'Last-Modified': object.uploaded.toUTCString() // 最終更新日時
-      }
-    });
-  } catch (error) {
-    console.error('Error checking blob:', error);
-    return new Response(null, { 
-      status: 500, 
-      headers: corsHeaders 
-    });
-  }
-}
-
-// BUD-02: PUT /upload - オブジェクトのアップロード
-async function handleUpload(request, env, corsHeaders) {
-  // 認証の確認
-  const authResult = await verifyAuthorization(request, env, 'upload');
-  if (!authResult.valid) {
-    return new Response(authResult.error, { 
-      status: 401, 
-      headers: corsHeaders 
-    });
-  }
-
-  // ファイルデータの取得とContent-Typeの特定
-  const contentType = request.headers.get('Content-Type') || 'application/octet-stream';
-  const fileData = await request.arrayBuffer();
-  
-  // ファイルサイズの検証
-  const maxSize = parseInt(env.MAX_FILE_SIZE) || DEFAULT_MAX_FILE_SIZE;
-  if (fileData.byteLength > maxSize) {
-    return new Response(`File too large. Maximum size: ${maxSize} bytes`, { 
-      status: 413, 
-      headers: corsHeaders 
-    });
-  }
-
-  // MIMEタイプの検証
-  const allowedTypes = env.ALLOWED_MIME_TYPES ? 
-    env.ALLOWED_MIME_TYPES.split(',').map(t => t.trim()) : 
-    DEFAULT_ALLOWED_MIME_TYPES;
-    
-  if (!allowedTypes.includes(contentType)) {
-    return new Response(`Unsupported file type: ${contentType}`, { 
-      status: 415, 
-      headers: corsHeaders 
-    });
-  }
-
-  // SHA256ハッシュの計算
-  const hash = await calculateSHA256(fileData);
-  
-  // 既に同じハッシュのオブジェクトが存在するか確認
-  const existingObject = await env.BLOSSOM_BUCKET.head(hash);
-  if (existingObject) {
-    // 存在する場合は既存のオブジェクトのディスクリプタを返す (重複アップロード防止)
-    const extension = MIME_TO_EXT[contentType] || '';
-    const url = `${new URL(request.url).origin}/${hash}${extension}`;
-    
-    return new Response(JSON.stringify({
-      sha256: hash,
-      size: existingObject.size,
-      type: contentType,
-      uploaded: Math.floor(existingObject.uploaded.getTime() / 1000),
-      url: url
-    }), {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'application/json'
-      }
-    });
-  }
-
-  // TTL (Time To Live) の設定 (24時間)
-  const ttl = 24 * 60 * 60; 
-  const expiresAt = new Date(Date.now() + ttl * 1000);
-  
-  try {
-    // R2にオブジェクトを保存
-    await env.BLOSSOM_BUCKET.put(hash, fileData, {
-      customMetadata: {
-        contentType: contentType,
-        uploader: authResult.pubkey, // アップロード者の公開鍵をメタデータとして保存
-        expiresAt: expiresAt.toISOString() // 期限切れ日時をメタデータとして保存
-      },
-      httpMetadata: {
-        contentType: contentType
-      }
-    });
-
-    // オブジェクトのディスクリプタを生成して応答
-    const extension = MIME_TO_EXT[contentType] || '';
-    const url = `${new URL(request.url).origin}/${hash}${extension}`;
-    
-    const blobDescriptor = {
-      sha256: hash,
-      size: fileData.byteLength,
-      type: contentType,
-      uploaded: Math.floor(Date.now() / 1000),
-      url: url
-    };
-
-    return new Response(JSON.stringify(blobDescriptor), {
-      status: 201, // 201 Created ステータス
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'application/json'
-      }
-    });
-
-  } catch (error) {
-    console.error('Error uploading blob:', error);
-    return new Response('Upload failed', { 
-      status: 500, 
-      headers: corsHeaders 
-    });
-  }
-}
-
-// BUD-06: HEAD /upload - アップロード要件の取得
-async function handleUploadRequirements(request, env, corsHeaders) {
-  // 環境変数から最大サイズと許可MIMEタイプを取得
-  const maxSize = parseInt(env.MAX_FILE_SIZE) || DEFAULT_MAX_FILE_SIZE;
-  const allowedTypes = env.ALLOWED_MIME_TYPES ? 
-    env.ALLOWED_MIME_TYPES.split(',').map(t => t.trim()) : 
-    DEFAULT_ALLOWED_MIME_TYPES;
-
-  // 要件をヘッダーとして応答
-  return new Response(null, {
-    headers: {
-      ...corsHeaders,
-      'X-Max-File-Size': maxSize.toString(),
-      'X-Allowed-MIME-Types': allowedTypes.join(','),
-      'X-TTL': '86400' // 24時間
-    }
+  return response(head ? null : object.body, 200, {
+    'Content-Type': object.customMetadata?.contentType || 'application/octet-stream',
+    'Content-Length': String(object.size), ETag: '"' + hash + '"',
+    'Last-Modified': object.uploaded.toUTCString(), Sunset: new Date(expiresAt(object)).toUTCString(),
+    'Content-Security-Policy': "default-src 'none'; sandbox",
   });
 }
-
-// BUD-02: GET /list/<pubkey> - オブジェクトのリスト表示 (★新規実装/修正★)
-async function handleListBlobs(request, env, pathname, corsHeaders) {
-  const pubkey = pathname.split('/')[2];
-  
-  // Debug log: Requested pubkey
-  console.log(`handleListBlobs: Requested pubkey = ${pubkey}`);
-
-  if (!isValidPubkey(pubkey)) {
-    return new Response('Invalid pubkey format', { 
-      status: 400, 
-      headers: corsHeaders 
-    });
-  }
-
-  // オプションの認証チェック（リスト表示は認証なしでも可能）
-  const authResult = await verifyAuthorization(request, env, 'list', false); // required = false
-
-  try {
-    // ★重要: R2のlist()でcustomMetadataを含めるようにincludeオプションを追加★
-    const objects = await env.BLOSSOM_BUCKET.list({ include: ['customMetadata'] });
-    const userBlobs = [];
-    const now = Date.now();
-
-    // Debug log: Number of objects returned by R2 list()
-    console.log(`handleListBlobs: Total objects from R2 list = ${objects.objects.length}`);
-    if (objects.truncated) {
-        console.log(`handleListBlobs: R2 list is truncated, cursor = ${objects.cursor}`);
-    }
-
-    for (const object of objects.objects) {
-      // customMetadataが取得されることを確認 (undefinedではなくなるはず)
-      const metadata = object.customMetadata || {};
-      
-      // Debug log: Current object key and its uploader metadata
-      console.log(`handleListBlobs: Checking object key = ${object.key}, uploader = ${metadata.uploader}, expiresAt = ${metadata.expiresAt}`);
-
-      // 期限切れのオブジェクトをチェックし、期限切れなら削除してスキップ
-      if (metadata.expiresAt && new Date(metadata.expiresAt).getTime() < now) {
-        console.log(`Deleting expired object: ${object.key}`);
-        await env.BLOSSOM_BUCKET.delete(object.key);
-        continue;
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url), method = request.method;
+    try {
+      if (method === 'OPTIONS') return response(null);
+      if (method === 'GET' && url.pathname === '/') return response('Blossom Server API is running. See documentation for usage.');
+      const blob = url.pathname.match(/^\/([a-f0-9]{64})(?:\.[a-zA-Z0-9]+)?$/);
+      if (blob && ['GET', 'HEAD'].includes(method)) return await getBlob(request, env, blob[1]);
+      const list = url.pathname.match(/^\/list\/([a-f0-9]{64})$/);
+      if ((url.pathname === '/upload' && ['PUT', 'HEAD'].includes(method)) || list || (blob && method === 'DELETE')) {
+        await rateLimit(env, 'ip:' + (request.headers.get('CF-Connecting-IP') || 'unknown'));
       }
-      
-      // アップローダーの公開鍵が一致する場合のみリストに追加
-      if (metadata.uploader === pubkey) {
-        console.log(`handleListBlobs: Match found for key = ${object.key}`);
-        const urlOrigin = new URL(request.url).origin; // リクエストのオリジンを使用
-        const extension = MIME_TO_EXT[metadata.contentType] || '';
-        const url = `${urlOrigin}/${object.key}${extension}`; // 正しいURLを構築
-        
-        userBlobs.push({
-          sha256: object.key,
-          size: object.size,
-          type: metadata.contentType || 'application/octet-stream',
-          uploaded: Math.floor(object.uploaded.getTime() / 1000),
-          url: url,
-          // BUD-02では含まれていないが、デバッグのために追加することも可能
-          // expiresAt: metadata.expiresAt
-        });
+      if (url.pathname === '/upload' && method === 'PUT') return await upload(request, env, policy(env));
+      if (url.pathname === '/upload' && method === 'HEAD') {
+        const config = policy(env), metadata = uploadMetadata(request, config, true);
+        const auth = await authorize(request, env, 'upload', metadata.hash);
+        await rateLimit(env, 'upload:' + auth.pubkey);
+        return response(null, 200, { 'X-Max-File-Size': String(config.maxSize),
+          'X-Allowed-MIME-Types': config.types.join(','), 'X-TTL': '86400' });
       }
-    }
-
-    // Debug log: Final number of blobs to return
-    console.log(`handleListBlobs: Returning ${userBlobs.length} blobs.`);
-
-    return new Response(JSON.stringify(userBlobs), {
-      headers: {
-        ...corsHeaders,
-        'Content-Type': 'application/json'
+      if (list && method === 'GET') {
+        await authorize(request, env, 'list', null, false);
+        return json(await listBlobs(env.BLOSSOM_BUCKET, list[1], url.searchParams, url.origin));
       }
-    });
-
-  } catch (error) {
-    console.error('Error listing blobs:', error);
-    return new Response('Internal Server Error', { 
-      status: 500, 
-      headers: corsHeaders 
-    });
-  }
-}
-
-// BUD-02: DELETE /<SHA256> - オブジェクトの削除
-async function handleDeleteBlob(request, env, pathname, corsHeaders) {
-  // パスからハッシュと拡張子を抽出
-  const hash = pathname.substring(1).split('.')[0];
-
-  // SHA256形式のハッシュであるか検証
-  if (!isValidSHA256(hash)) {
-    return new Response('Invalid hash format', {
-      status: 400,
-      headers: corsHeaders
-    });
-  }
-
-  // 認証の確認
-  const authResult = await verifyAuthorization(request, env, 'delete');
-  if (!authResult.valid) {
-    return new Response(authResult.error, { 
-      status: 401, 
-      headers: corsHeaders 
-    });
-  }
-
-  try {
-    // オブジェクトの存在確認と所有権の検証
-    const object = await env.BLOSSOM_BUCKET.head(hash);
-    
-    if (!object) {
-      return new Response('Blob not found', { 
-        status: 404, 
-        headers: corsHeaders 
-      });
+      if (blob && method === 'DELETE') {
+        const hash = blob[1], auth = await authorize(request, env, 'delete', hash);
+        await rateLimit(env, 'delete:' + auth.pubkey);
+        const object = await env.BLOSSOM_BUCKET.head(hash);
+        if (!object) throw new HttpError(404, 'Blob not found');
+        if (object.customMetadata?.uploader !== auth.pubkey) throw new HttpError(403, 'Not the uploader');
+        await env.BLOSSOM_BUCKET.delete(hash);
+        // Delete the index only after the authoritative object is gone.
+        await env.BLOSSOM_BUCKET.delete(indexKey(object));
+        return response(null, 204);
+      }
+      throw new HttpError(404, 'Not Found');
+    } catch (error) {
+      const status = error instanceof HttpError ? error.status : 503;
+      const reason = error instanceof HttpError ? error.message : 'Storage or service temporarily unavailable';
+      return response(request.method === 'HEAD' ? null : reason, status,
+        { 'X-Reason': reason, ...([429, 503].includes(status) ? { 'Retry-After': '60' } : {}) });
     }
-
-    const metadata = object.customMetadata || {};
-    // アップロード者と認証された公開鍵が一致するか確認 (所有権チェック)
-    if (metadata.uploader !== authResult.pubkey) {
-      return new Response('Unauthorized - not the uploader', { 
-        status: 403, 
-        headers: corsHeaders 
-      });
-    }
-
-    // オブジェクトをR2から削除
-    await env.BLOSSOM_BUCKET.delete(hash);
-
-    // 204 No Content ステータスで応答
-    return new Response(null, { 
-      status: 204, 
-      headers: corsHeaders 
-    });
-
-  } catch (error) {
-    console.error('Error deleting blob:', error);
-    return new Response('Internal Server Error', { 
-      status: 500, 
-      headers: corsHeaders 
-    });
-  }
-}
-
-// 認証の検証 (Nostrイベント kind:24242)
-async function verifyAuthorization(request, env, action, required = true) {
-  const authHeader = request.headers.get('Authorization');
-  
-  // 認証ヘッダーが不要な場合（例：リスト表示）
-  if (!authHeader && !required) {
-    return { valid: true, pubkey: null };
-  }
-
-  // 認証ヘッダーがない場合
-  if (!authHeader) {
-    return { valid: false, error: 'Authorization header required' };
-  }
-
-  // "Nostr " プレフィックスの確認
-  if (!authHeader.startsWith('Nostr ')) {
-    return { valid: false, error: 'Invalid authorization format' };
-  }
-
-  const eventData = authHeader.substring(6); // 'Nostr ' プレフィックスを除去
-  
-  try {
-    const event = JSON.parse(atob(eventData)); // Base64デコードとJSONパース
-    
-    // イベント構造の検証
-    if (event.kind !== 24242) {
-      return { valid: false, error: 'Invalid event kind' };
-    }
-
-    // 許可された公開鍵リストのチェック
-    const allowedPubkeys = env.ALLOWED_PUBKEYS ? 
-      env.ALLOWED_PUBKEYS.split(',').map(pk => pk.trim()) : [];
-      
-    // 許可された公開鍵リストが設定されていて、現在の公開鍵が含まれていない場合
-    if (allowedPubkeys.length > 0 && !allowedPubkeys.includes(event.pubkey)) {
-      return { valid: false, error: 'Pubkey not authorized' };
-    }
-
-    // 基本的なイベント検証（実際のNostrプロトコルでは署名検証も必要）
-    if (!event.pubkey || !event.sig || !event.created_at) {
-      return { valid: false, error: 'Invalid event structure' };
-    }
-
-    // イベントの古さチェック（5分以内）
-    const eventAge = Math.floor(Date.now() / 1000) - event.created_at;
-    if (eventAge > 300) { 
-      return { valid: false, error: 'Event too old' };
-    }
-
-    // 認証成功
-    return { valid: true, pubkey: event.pubkey };
-
-  } catch (error) {
-    console.error('Auth verification error:', error);
-    return { valid: false, error: 'Invalid authorization format' }; 
-  }
-}
-
-// ユーティリティ関数
-// SHA256ハッシュ形式の検証
-function isValidSHA256(hash) {
-  return /^[a-f0-9]{64}$/.test(hash);
-}
-
-// 公開鍵形式の検証
-function isValidPubkey(pubkey) {
-  return /^[a-f0-9]{64}$/.test(pubkey);
-}
-
-// SHA256ハッシュの計算
-async function calculateSHA256(data) {
-  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-  const hashArray = Array.from(new Uint8Array(hashBuffer));
-  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
+  },
+  async scheduled(event, env) { await maintainIndex(env); },
+};
 export { isValidSHA256, isValidPubkey, calculateSHA256 };

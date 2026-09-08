@@ -14,7 +14,7 @@ Implementation of a file storage server for the [Blossom protocol](https://githu
 - **[BUD-06](https://github.com/hzrd149/blossom/blob/master/buds/06.md)**: Upload requirements
 - **[Nostr](https://github.com/nostr-protocol/nostr) Authentication**: Authentication and access control using public keys
 - **R2 Storage**: High-speed file storage using Cloudflare R2
-- **Auto Deletion**: 24-hour TTL stored in object metadata, lazy cleanup on `GET /list/<pubkey>`, plus permanent removal via R2 lifecycle rules
+- **Auto Deletion**: 24-hour TTL enforced on retrieval and listing; physical removal via R2 lifecycle rules
 - **File Restrictions**: MIME type and file size limitations
 
 ## Setup
@@ -109,8 +109,16 @@ npm run tail
 | GET    | `/<sha256>[.ext]`     | BUD-01 | Retrieve a blob                              | No   |
 | HEAD   | `/<sha256>[.ext]`     | BUD-01 | Check whether a blob exists                  | No   |
 | PUT    | `/upload`             | BUD-02 | Upload a blob, returns blob descriptor JSON  | Yes  |
-| HEAD   | `/upload`             | BUD-06 | Returns upload requirements as headers       | No   |
-| GET    | `/list/<pubkey>`      | BUD-02 | List blobs uploaded by the given pubkey      | Optional |
-| DELETE | `/<sha256>[.ext]`     | BUD-02 | Delete a blob (uploader only)                | Yes  |
+| HEAD   | `/upload`             | BUD-06 | Returns upload requirements as headers       | Yes  |
+| GET    | `/list/<pubkey>`      | BUD-12 | List blobs uploaded by the given pubkey      | Optional |
+| DELETE | `/<sha256>[.ext]`     | BUD-12 | Delete a blob (uploader only)                | Yes  |
 
-Authentication uses Nostr `kind:24242` events, base64-encoded and supplied via the `Authorization: Nostr <base64-event>` header. Events older than 5 minutes are rejected.
+Authentication uses Nostr `kind:24242` events, base64-encoded and supplied via the `Authorization: Nostr <base64-event>` header. Event IDs and Schnorr signatures are verified. Upload/delete tokens must contain matching `t` and `x` tags, a future `expiration`, and a non-future `created_at`. Optional `server` tags are enforced. Base64url/UTF-8 and legacy Base64 are accepted.
+
+## Security and upgrade notes
+
+Read [SECURITY_FIXES.md](./SECURITY_FIXES.md) before upgrading an existing bucket. Upload size is capped at 32 MiB for memory safety. Native rate limiting and a scheduled R2 index backfill are configured in both environments. Lists support `?limit=1..20&cursor=<last-sha256>` in descending upload order; legacy blobs become listed after backfill. Blob bytes are never rewritten.
+
+`HEAD /upload` requires upload authorization and `X-SHA-256`, `X-Content-Type`, `X-Content-Length` headers, and returns a rejection status with `X-Reason` when applicable. Clients can skip HEAD and upload directly. Authentication is defined by [BUD-11](https://github.com/hzrd149/blossom/blob/master/buds/11.md); list/delete by [BUD-12](https://github.com/hzrd149/blossom/blob/master/buds/12.md).
+
+Run `npm test` for signed regression tests and `npm run test:integration` for local Workers/R2 integration tests.
